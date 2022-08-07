@@ -29,7 +29,6 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/paths"
 	"tailscale.com/safesocket"
-	"tailscale.com/syncs"
 	"tailscale.com/version/distro"
 )
 
@@ -129,6 +128,8 @@ var localClient tailscale.LocalClient
 
 // Run runs the CLI. The args do not include the binary name.
 func Run(args []string) (err error) {
+	args = CleanUpArgs(args)
+
 	if len(args) == 1 && (args[0] == "-V" || args[0] == "--version") {
 		args = []string{"version"}
 	}
@@ -228,8 +229,6 @@ var rootArgs struct {
 	socket string
 }
 
-var gotSignal syncs.AtomicBool
-
 func connect(ctx context.Context) (net.Conn, *ipn.BackendClient, context.Context, context.CancelFunc) {
 	s := safesocket.DefaultConnectionStrategy(rootArgs.socket)
 	c, err := safesocket.Connect(s)
@@ -255,7 +254,6 @@ func connect(ctx context.Context) (net.Conn, *ipn.BackendClient, context.Context
 			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 			return
 		}
-		gotSignal.Set(true)
 		c.Close()
 		cancel()
 	}()

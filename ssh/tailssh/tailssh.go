@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -29,15 +30,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gossh "github.com/tailscale/golang-x-crypto/ssh"
-	"inet.af/netaddr"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/logtail/backoff"
 	"tailscale.com/net/tsaddr"
-	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tempfork/gliderlabs/ssh"
 	"tailscale.com/types/logger"
@@ -62,15 +62,14 @@ type server struct {
 	sessionWaitGroup sync.WaitGroup
 
 	// mu protects the following
-	mu                      sync.Mutex
-	activeSessionByH        map[string]*sshSession      // ssh.SessionID (DH H) => session
-	activeSessionBySharedID map[string]*sshSession      // yyymmddThhmmss-XXXXX => session
-	fetchPublicKeysCache    map[string]pubKeyCacheEntry // by https URL
-	shutdownCalled          bool
+	mu                   sync.Mutex
+	activeConns          map[*conn]bool              // set; value is always true
+	fetchPublicKeysCache map[string]pubKeyCacheEntry // by https URL
+	shutdownCalled       bool
 }
 
 func (srv *server) now() time.Time {
-	if srv.timeNow != nil {
+	if srv != nil && srv.timeNow != nil {
 		return srv.timeNow()
 	}
 	return time.Now()
@@ -91,14 +90,28 @@ func init() {
 	})
 }
 
+func (srv *server) trackActiveConn(c *conn, add bool) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if add {
+		mak.Set(&srv.activeConns, c, true)
+		return
+	}
+	delete(srv.activeConns, c)
+}
+
 // HandleSSHConn handles a Tailscale SSH connection from c.
-func (srv *server) HandleSSHConn(c net.Conn) error {
+// This is the entry point for all SSH connections.
+// When this returns, the connection is closed.
+func (srv *server) HandleSSHConn(nc net.Conn) error {
 	metricIncomingConnections.Add(1)
-	ss, err := srv.newConn()
+	c, err := srv.newConn()
 	if err != nil {
 		return err
 	}
-	ss.HandleConn(c)
+	srv.trackActiveConn(c, true)        // add
+	defer srv.trackActiveConn(c, false) // remove
+	c.HandleConn(nc)
 
 	// Return nil to signal to netstack's interception that it doesn't need to
 	// log. If ss.HandleConn had problems, it can log itself (ideally on an
@@ -110,11 +123,13 @@ func (srv *server) HandleSSHConn(c net.Conn) error {
 func (srv *server) Shutdown() {
 	srv.mu.Lock()
 	srv.shutdownCalled = true
-	for _, s := range srv.activeSessionByH {
-		s.ctx.CloseWithError(userVisibleError{
-			fmt.Sprintf("Tailscale SSH is shutting down.\r\n"),
-			context.Canceled,
-		})
+	for c := range srv.activeConns {
+		for _, s := range c.sessions {
+			s.ctx.CloseWithError(userVisibleError{
+				fmt.Sprintf("Tailscale SSH is shutting down.\r\n"),
+				context.Canceled,
+			})
+		}
 	}
 	srv.mu.Unlock()
 	srv.sessionWaitGroup.Wait()
@@ -125,8 +140,16 @@ func (srv *server) Shutdown() {
 func (srv *server) OnPolicyChange() {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
-	for _, s := range srv.activeSessionByH {
-		go s.checkStillValid()
+	for c := range srv.activeConns {
+		c.mu.Lock()
+		ci := c.info
+		c.mu.Unlock()
+		if ci == nil {
+			// c.info is nil when the connection hasn't been authenticated yet.
+			// In that case, the connection will be terminated when it is.
+			continue
+		}
+		go c.checkStillValid()
 	}
 }
 
@@ -135,34 +158,42 @@ func (srv *server) OnPolicyChange() {
 type conn struct {
 	*ssh.Server
 
-	// now is the time to consider the present moment for the
-	// purposes of rule evaluation.
-	now time.Time
+	insecureSkipTailscaleAuth bool // used by tests.
 
-	action0      *tailcfg.SSHAction // first matching action
-	srv          *server
-	info         *sshConnInfo // set by setInfo
+	connID  string             // ID that's shared with control
+	action0 *tailcfg.SSHAction // first matching action
+	srv     *server
+
+	mu           sync.Mutex   // protects the following
 	localUser    *user.User   // set by checkAuth
 	userGroupIDs []string     // set by checkAuth
-
-	insecureSkipTailscaleAuth bool // used by tests.
+	info         *sshConnInfo // set by setInfo
+	// idH is the RFC4253 sec8 hash H. It is used to identify the connection,
+	// and is shared among all sessions. It should not be shared outside
+	// process. It is confusingly referred to as SessionID by the gliderlabs/ssh
+	// library.
+	idH            string
+	pubKey         gossh.PublicKey    // set by authorizeSession
+	finalAction    *tailcfg.SSHAction // set by authorizeSession
+	finalActionErr error              // set by authorizeSession
+	sessions       []*sshSession
 }
 
 func (c *conn) logf(format string, args ...any) {
-	if c.info == nil {
-		c.srv.logf(format, args...)
-		return
-	}
-	format = fmt.Sprintf("%v: %v", c.info.String(), format)
+	format = fmt.Sprintf("%v: %v", c.connID, format)
 	c.srv.logf(format, args...)
 }
 
 // PublicKeyHandler implements ssh.PublicKeyHandler is called by the the
 // ssh.Server when the client presents a public key.
 func (c *conn) PublicKeyHandler(ctx ssh.Context, pubKey ssh.PublicKey) error {
-	if c.info == nil {
+	c.mu.Lock()
+	ci := c.info
+	c.mu.Unlock()
+	if ci == nil {
 		return gossh.ErrDenied
 	}
+
 	if err := c.checkAuth(pubKey); err != nil {
 		// TODO(maisem/bradfitz): surface the error here.
 		c.logf("rejecting SSH public key %s: %v", bytes.TrimSpace(gossh.MarshalAuthorizedKey(pubKey)), err)
@@ -198,7 +229,7 @@ func (c *conn) NoClientAuthCallback(cm gossh.ConnMetadata) (*gossh.Permissions, 
 func (c *conn) checkAuth(pubKey ssh.PublicKey) error {
 	a, localUser, err := c.evaluatePolicy(pubKey)
 	if err != nil {
-		if pubKey == nil && c.havePubKeyPolicy(c.info) {
+		if pubKey == nil && c.havePubKeyPolicy() {
 			return errPubKeyRequired
 		}
 		return fmt.Errorf("%w: %v", gossh.ErrDenied, err)
@@ -217,6 +248,8 @@ func (c *conn) checkAuth(pubKey ssh.PublicKey) error {
 		if err != nil {
 			return err
 		}
+		c.mu.Lock()
+		defer c.mu.Unlock()
 		c.userGroupIDs = gids
 		c.localUser = lu
 		return nil
@@ -247,21 +280,23 @@ func (c *conn) ServerConfig(ctx ssh.Context) *gossh.ServerConfig {
 
 func (srv *server) newConn() (*conn, error) {
 	srv.mu.Lock()
-	shutdownCalled := srv.shutdownCalled
-	srv.mu.Unlock()
-	if shutdownCalled {
+	if srv.shutdownCalled {
+		srv.mu.Unlock()
 		// Stop accepting new connections.
 		// Connections in the auth phase are handled in handleConnPostSSHAuth.
 		// Existing sessions are terminated by Shutdown.
 		return nil, gossh.ErrDenied
 	}
-	c := &conn{srv: srv, now: srv.now()}
+	srv.mu.Unlock()
+	c := &conn{srv: srv}
+	now := srv.now()
+	c.connID = fmt.Sprintf("ssh-conn-%s-%02x", now.UTC().Format("20060102T150405"), randBytes(5))
 	c.Server = &ssh.Server{
 		Version:         "Tailscale",
-		Handler:         c.handleConnPostSSHAuth,
+		Handler:         c.handleSessionPostSSHAuth,
 		RequestHandlers: map[string]ssh.RequestHandler{},
 		SubsystemHandlers: map[string]ssh.SubsystemHandler{
-			"sftp": c.handleConnPostSSHAuth,
+			"sftp": c.handleSessionPostSSHAuth,
 		},
 
 		// Note: the direct-tcpip channel handler and LocalPortForwardingCallback
@@ -270,7 +305,7 @@ func (srv *server) newConn() (*conn, error) {
 		ChannelHandlers: map[string]ssh.ChannelHandler{
 			"direct-tcpip": ssh.DirectTCPIPHandler,
 		},
-		LocalPortForwardingCallback: srv.mayForwardLocalPortTo,
+		LocalPortForwardingCallback: c.mayForwardLocalPortTo,
 
 		PublicKeyHandler:     c.PublicKeyHandler,
 		ServerConfigCallback: c.ServerConfig,
@@ -298,21 +333,23 @@ func (srv *server) newConn() (*conn, error) {
 // mayForwardLocalPortTo reports whether the ctx should be allowed to port forward
 // to the specified host and port.
 // TODO(bradfitz/maisem): should we have more checks on host/port?
-func (srv *server) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
-	ss, ok := srv.getSessionForContext(ctx)
-	if !ok {
-		return false
+func (c *conn) mayForwardLocalPortTo(ctx ssh.Context, destinationHost string, destinationPort uint32) bool {
+	if c.finalAction != nil && c.finalAction.AllowLocalPortForwarding {
+		metricLocalPortForward.Add(1)
+		return true
 	}
-	if !ss.action.AllowLocalPortForwarding {
-		return false
-	}
-	metricLocalPortForward.Add(1)
-	return true
+	return false
 }
 
 // havePubKeyPolicy reports whether any policy rule may provide access by means
 // of a ssh.PublicKey.
-func (c *conn) havePubKeyPolicy(ci *sshConnInfo) bool {
+func (c *conn) havePubKeyPolicy() bool {
+	c.mu.Lock()
+	ci := c.info
+	c.mu.Unlock()
+	if ci == nil {
+		panic("havePubKeyPolicy called before setInfo")
+	}
 	// Is there any rule that looks like it'd require a public key for this
 	// sshUser?
 	pol, ok := c.sshPolicy()
@@ -367,16 +404,16 @@ func (c *conn) sshPolicy() (_ *tailcfg.SSHPolicy, ok bool) {
 	return nil, false
 }
 
-func toIPPort(a net.Addr) (ipp netaddr.IPPort) {
+func toIPPort(a net.Addr) (ipp netip.AddrPort) {
 	ta, ok := a.(*net.TCPAddr)
 	if !ok {
 		return
 	}
-	tanetaddr, ok := netaddr.FromStdIP(ta.IP)
+	tanetaddr, ok := netip.AddrFromSlice(ta.IP)
 	if !ok {
 		return
 	}
-	return netaddr.IPPortFrom(tanetaddr, uint16(ta.Port))
+	return netip.AddrPortFrom(tanetaddr.Unmap(), uint16(ta.Port))
 }
 
 // connInfo returns a populated sshConnInfo from the provided arguments,
@@ -387,20 +424,23 @@ func (c *conn) setInfo(cm gossh.ConnMetadata) error {
 		src:     toIPPort(cm.RemoteAddr()),
 		dst:     toIPPort(cm.LocalAddr()),
 	}
-	if !tsaddr.IsTailscaleIP(ci.dst.IP()) {
+	if !tsaddr.IsTailscaleIP(ci.dst.Addr()) {
 		return fmt.Errorf("tailssh: rejecting non-Tailscale local address %v", ci.dst)
 	}
-	if !tsaddr.IsTailscaleIP(ci.src.IP()) {
+	if !tsaddr.IsTailscaleIP(ci.src.Addr()) {
 		return fmt.Errorf("tailssh: rejecting non-Tailscale remote address %v", ci.src)
 	}
 	node, uprof, ok := c.srv.lb.WhoIs(ci.src)
 	if !ok {
 		return fmt.Errorf("unknown Tailscale identity from src %v", ci.src)
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	ci.node = node
 	ci.uprof = &uprof
 
 	c.info = ci
+	c.logf("handling conn: %v", ci.String())
 	return nil
 }
 
@@ -516,32 +556,47 @@ func (srv *server) fetchPublicKeysURL(url string) ([]string, error) {
 	return lines, err
 }
 
-// handleConnPostSSHAuth runs an SSH session after the SSH-level authentication,
-// but not necessarily before all the Tailscale-level extra verification has
-// completed. It also handles SFTP requests.
-func (c *conn) handleConnPostSSHAuth(s ssh.Session) {
-	if s.PublicKey() != nil {
-		metricPublicKeyConnections.Add(1)
+func (c *conn) authorizeSession(s ssh.Session) (_ *contextReader, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idH := s.Context().(ssh.Context).SessionID()
+	if c.idH == "" {
+		c.idH = idH
+	} else if c.idH != idH {
+		c.logf("ssh: session ID mismatch: %q != %q", c.idH, idH)
+		s.Exit(1)
+		return nil, false
 	}
-	sshUser := s.User()
 	cr := &contextReader{r: s}
-	action, err := c.resolveTerminalAction(s, cr)
+	action, err := c.resolveTerminalActionLocked(s, cr)
 	if err != nil {
 		c.logf("resolveTerminalAction: %v", err)
 		io.WriteString(s.Stderr(), "Access Denied: failed during authorization check.\r\n")
 		s.Exit(1)
-		return
+		return nil, false
 	}
 	if action.Reject || !action.Accept {
 		c.logf("access denied for %v", c.info.uprof.LoginName)
 		s.Exit(1)
+		return nil, false
+	}
+	return cr, true
+}
+
+// handleSessionPostSSHAuth runs an SSH session after the SSH-level authentication,
+// but not necessarily before all the Tailscale-level extra verification has
+// completed. It also handles SFTP requests.
+func (c *conn) handleSessionPostSSHAuth(s ssh.Session) {
+	// Now that we have passed the SSH-level authentication, we can start the
+	// Tailscale-level extra verification. This means that we are going to
+	// evaluate the policy provided by control against the incoming SSH session.
+	cr, ok := c.authorizeSession(s)
+	if !ok {
 		return
 	}
-	if s.PublicKey() != nil {
-		metricPublicKeyAccepts.Add(1)
-	}
-
 	if cr.HasOutstandingRead() {
+		// There was some buffered input while we were waiting for the policy
+		// decision.
 		s = contextReaderSesssion{s, cr}
 	}
 
@@ -555,23 +610,42 @@ func (c *conn) handleConnPostSSHAuth(s ssh.Session) {
 		return
 	}
 
-	ss := c.newSSHSession(s, action)
-	ss.logf("handling new SSH connection from %v (%v) to ssh-user %q", c.info.uprof.LoginName, c.info.src.IP(), sshUser)
-	ss.logf("access granted to %v as ssh-user %q", c.info.uprof.LoginName, sshUser)
+	ss := c.newSSHSession(s)
+	c.mu.Lock()
+	ss.logf("handling new SSH connection from %v (%v) to ssh-user %q", c.info.uprof.LoginName, c.info.src.Addr(), c.localUser.Username)
+	ss.logf("access granted to %v as ssh-user %q", c.info.uprof.LoginName, c.localUser.Username)
+	c.mu.Unlock()
 	ss.run()
 }
 
-// resolveTerminalAction either returns action0 (if it's Accept or Reject) or
+// resolveTerminalActionLocked either returns action0 (if it's Accept or Reject) or
 // else loops, fetching new SSHActions from the control plane.
 //
 // Any action with a Message in the chain will be printed to s.
 //
 // The returned SSHAction will be either Reject or Accept.
-func (c *conn) resolveTerminalAction(s ssh.Session, cr *contextReader) (*tailcfg.SSHAction, error) {
-	action := c.action0
+//
+// c.mu must be held.
+func (c *conn) resolveTerminalActionLocked(s ssh.Session, cr *contextReader) (action *tailcfg.SSHAction, err error) {
+	if c.finalAction != nil || c.finalActionErr != nil {
+		return c.finalAction, c.finalActionErr
+	}
+
+	if s.PublicKey() != nil {
+		metricPublicKeyConnections.Add(1)
+	}
+	defer func() {
+		c.finalAction = action
+		c.finalActionErr = err
+		c.pubKey = s.PublicKey()
+		if c.pubKey != nil && action.Accept {
+			metricPublicKeyAccepts.Add(1)
+		}
+	}()
+	action = c.action0
 
 	var awaitReadOnce sync.Once // to start Reads on cr
-	var sawInterrupt syncs.AtomicBool
+	var sawInterrupt atomic.Bool
 	var wg sync.WaitGroup
 	defer wg.Wait() // wait for awaitIntrOnce's goroutine to exit
 
@@ -613,7 +687,7 @@ func (c *conn) resolveTerminalAction(s ssh.Session, cr *contextReader) (*tailcfg
 						return
 					}
 					if n > 0 && buf[0] == 0x03 { // Ctrl-C
-						sawInterrupt.Set(true)
+						sawInterrupt.Store(true)
 						s.Stderr().Write([]byte("Canceled.\r\n"))
 						s.Exit(1)
 						return
@@ -621,11 +695,11 @@ func (c *conn) resolveTerminalAction(s ssh.Session, cr *contextReader) (*tailcfg
 				}
 			}()
 		})
-		url = c.expandDelegateURL(url)
+		url = c.expandDelegateURLLocked(url)
 		var err error
 		action, err = c.fetchSSHAction(ctx, url)
 		if err != nil {
-			if sawInterrupt.Get() {
+			if sawInterrupt.Load() {
 				metricTerminalInterrupt.Add(1)
 				return nil, fmt.Errorf("aborted by user")
 			} else {
@@ -636,20 +710,21 @@ func (c *conn) resolveTerminalAction(s ssh.Session, cr *contextReader) (*tailcfg
 	}
 }
 
-func (c *conn) expandDelegateURL(actionURL string) string {
+func (c *conn) expandDelegateURLLocked(actionURL string) string {
 	nm := c.srv.lb.NetMap()
 	ci := c.info
+	lu := c.localUser
 	var dstNodeID string
 	if nm != nil {
 		dstNodeID = fmt.Sprint(int64(nm.SelfNode.ID))
 	}
 	return strings.NewReplacer(
-		"$SRC_NODE_IP", url.QueryEscape(ci.src.IP().String()),
+		"$SRC_NODE_IP", url.QueryEscape(ci.src.Addr().String()),
 		"$SRC_NODE_ID", fmt.Sprint(int64(ci.node.ID)),
-		"$DST_NODE_IP", url.QueryEscape(ci.dst.IP().String()),
+		"$DST_NODE_IP", url.QueryEscape(ci.dst.Addr().String()),
 		"$DST_NODE_ID", dstNodeID,
 		"$SSH_USER", url.QueryEscape(ci.sshUser),
-		"$LOCAL_USER", url.QueryEscape(c.localUser.Username),
+		"$LOCAL_USER", url.QueryEscape(lu.Username),
 	).Replace(actionURL)
 }
 
@@ -659,10 +734,12 @@ func (c *conn) expandPublicKeyURL(pubKeyURL string) string {
 	}
 	var localPart string
 	var loginName string
+	c.mu.Lock()
 	if c.info.uprof != nil {
 		loginName = c.info.uprof.LoginName
 		localPart, _, _ = strings.Cut(loginName, "@")
 	}
+	c.mu.Unlock()
 	return strings.NewReplacer(
 		"$LOGINNAME_EMAIL", loginName,
 		"$LOGINNAME_LOCALPART", localPart,
@@ -672,19 +749,17 @@ func (c *conn) expandPublicKeyURL(pubKeyURL string) string {
 // sshSession is an accepted Tailscale SSH session.
 type sshSession struct {
 	ssh.Session
-	idH      string // the RFC4253 sec8 hash H; don't share outside process
 	sharedID string // ID that's shared with control
 	logf     logger.Logf
 
 	ctx           *sshContext // implements context.Context
 	conn          *conn
-	action        *tailcfg.SSHAction
 	agentListener net.Listener // non-nil if agent-forwarding requested+allowed
 
 	// initialized by launchProcess:
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
-	stdout io.Reader
+	stdout io.ReadCloser
 	stderr io.Reader // nil for pty sessions
 	ptyReq *ssh.Pty  // non-nil for pty sessions
 
@@ -699,43 +774,46 @@ func (ss *sshSession) vlogf(format string, args ...interface{}) {
 	}
 }
 
-func (c *conn) newSSHSession(s ssh.Session, action *tailcfg.SSHAction) *sshSession {
-	sharedID := fmt.Sprintf("%s-%02x", c.now.UTC().Format("20060102T150405"), randBytes(5))
+func (c *conn) newSSHSession(s ssh.Session) *sshSession {
+	sharedID := fmt.Sprintf("sess-%s-%02x", c.srv.now().UTC().Format("20060102T150405"), randBytes(5))
 	c.logf("starting session: %v", sharedID)
 	return &sshSession{
 		Session:  s,
-		idH:      s.Context().(ssh.Context).SessionID(),
 		sharedID: sharedID,
 		ctx:      newSSHContext(),
 		conn:     c,
 		logf:     logger.WithPrefix(c.srv.logf, "ssh-session("+sharedID+"): "),
-		action:   action,
 	}
 }
 
-func (c *conn) isStillValid(pubKey ssh.PublicKey) bool {
-	a, localUser, err := c.evaluatePolicy(pubKey)
+// isStillValid reports whether the conn is still valid.
+func (c *conn) isStillValid() bool {
+	a, localUser, err := c.evaluatePolicy(c.pubKey)
 	if err != nil {
 		return false
 	}
 	if !a.Accept && a.HoldAndDelegate == "" {
 		return false
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.localUser.Username == localUser
 }
 
-// checkStillValid checks that the session is still valid per the latest SSHPolicy.
-// If not, it terminates the session.
-func (ss *sshSession) checkStillValid() {
-	if ss.conn.isStillValid(ss.PublicKey()) {
+// checkStillValid checks that the conn is still valid per the latest SSHPolicy.
+// If not, it terminates all sessions associated with the conn.
+func (c *conn) checkStillValid() {
+	if c.isStillValid() {
 		return
 	}
 	metricPolicyChangeKick.Add(1)
-	ss.logf("session no longer valid per new SSH policy; closing")
-	ss.ctx.CloseWithError(userVisibleError{
-		fmt.Sprintf("Access revoked.\r\n"),
-		context.Canceled,
-	})
+	c.logf("session no longer valid per new SSH policy; closing")
+	for _, s := range c.sessions {
+		s.ctx.CloseWithError(userVisibleError{
+			fmt.Sprintf("Access revoked.\r\n"),
+			context.Canceled,
+		})
+	}
 }
 
 func (c *conn) fetchSSHAction(ctx context.Context, url string) (*tailcfg.SSHAction, error) {
@@ -791,48 +869,36 @@ func (ss *sshSession) killProcessOnContextDone() {
 				io.WriteString(ss.Stderr(), "\r\n\r\n"+msg+"\r\n\r\n")
 			}
 		}
-		ss.logf("terminating SSH session from %v: %v", ss.conn.info.src.IP(), err)
+		ss.logf("terminating SSH session from %v: %v", ss.conn.info.src.Addr(), err)
 		// We don't need to Process.Wait here, sshSession.run() does
 		// the waiting regardless of termination reason.
+
+		// TODO(maisem): should this be a SIGTERM followed by a SIGKILL?
 		ss.cmd.Process.Kill()
 	})
 }
 
-// sessionAction returns the SSHAction associated with the session.
-func (srv *server) getSessionForContext(sctx ssh.Context) (ss *sshSession, ok bool) {
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	ss, ok = srv.activeSessionByH[sctx.SessionID()]
-	return
-}
-
 // startSessionLocked registers ss as an active session.
 // It must be called with srv.mu held.
-func (srv *server) startSessionLocked(ss *sshSession) {
-	srv.sessionWaitGroup.Add(1)
-	if ss.idH == "" {
-		panic("empty idH")
-	}
+func (c *conn) startSessionLocked(ss *sshSession) {
+	c.srv.sessionWaitGroup.Add(1)
 	if ss.sharedID == "" {
 		panic("empty sharedID")
 	}
-	if _, dup := srv.activeSessionByH[ss.idH]; dup {
-		panic("dup idH")
-	}
-	if _, dup := srv.activeSessionBySharedID[ss.sharedID]; dup {
-		panic("dup sharedID")
-	}
-	mak.Set(&srv.activeSessionByH, ss.idH, ss)
-	mak.Set(&srv.activeSessionBySharedID, ss.sharedID, ss)
+	c.sessions = append(c.sessions, ss)
 }
 
 // endSession unregisters s from the list of active sessions.
-func (srv *server) endSession(ss *sshSession) {
-	defer srv.sessionWaitGroup.Done()
-	srv.mu.Lock()
-	defer srv.mu.Unlock()
-	delete(srv.activeSessionByH, ss.idH)
-	delete(srv.activeSessionBySharedID, ss.sharedID)
+func (c *conn) endSession(ss *sshSession) {
+	defer c.srv.sessionWaitGroup.Done()
+	c.srv.mu.Lock()
+	defer c.srv.mu.Unlock()
+	for i, s := range c.sessions {
+		if s == ss {
+			c.sessions = append(c.sessions[:i], c.sessions[i+1:]...)
+			break
+		}
+	}
 }
 
 var errSessionDone = errors.New("session is done")
@@ -841,7 +907,7 @@ var errSessionDone = errors.New("session is done")
 // forwards agent connections between the listener and the ssh.Session.
 // On success, it assigns ss.agentListener.
 func (ss *sshSession) handleSSHAgentForwarding(s ssh.Session, lu *user.User) error {
-	if !ssh.AgentRequested(ss) || !ss.action.AllowAgentForwarding {
+	if !ssh.AgentRequested(ss) || !ss.conn.finalAction.AllowAgentForwarding {
 		return nil
 	}
 	ss.logf("ssh: agent forwarding requested")
@@ -906,15 +972,17 @@ func (ss *sshSession) run() {
 		ss.Exit(1)
 		return
 	}
-	srv.startSessionLocked(ss)
+	ss.conn.startSessionLocked(ss)
+	lu := ss.conn.localUser
+	localUser := lu.Username
 	srv.mu.Unlock()
 
-	defer srv.endSession(ss)
+	defer ss.conn.endSession(ss)
 
-	if ss.action.SessionDuration != 0 {
-		t := time.AfterFunc(ss.action.SessionDuration, func() {
+	if ss.conn.finalAction.SessionDuration != 0 {
+		t := time.AfterFunc(ss.conn.finalAction.SessionDuration, func() {
 			ss.ctx.CloseWithError(userVisibleError{
-				fmt.Sprintf("Session timeout of %v elapsed.", ss.action.SessionDuration),
+				fmt.Sprintf("Session timeout of %v elapsed.", ss.conn.finalAction.SessionDuration),
 				context.DeadlineExceeded,
 			})
 		})
@@ -922,8 +990,6 @@ func (ss *sshSession) run() {
 	}
 
 	logf := ss.logf
-	lu := ss.conn.localUser
-	localUser := lu.Username
 
 	if euid := os.Geteuid(); euid != 0 {
 		if lu.Uid != fmt.Sprint(euid) {
@@ -969,20 +1035,23 @@ func (ss *sshSession) run() {
 	go ss.killProcessOnContextDone()
 
 	go func() {
-		_, err := io.Copy(rec.writer("i", ss.stdin), ss)
-		if err != nil {
-			// TODO: don't log in the success case.
+		defer ss.stdin.Close()
+		if _, err := io.Copy(rec.writer("i", ss.stdin), ss); err != nil {
 			logf("stdin copy: %v", err)
+			ss.ctx.CloseWithError(err)
+		} else if ss.ptyReq != nil {
+			const EOT = 4 // https://en.wikipedia.org/wiki/End-of-Transmission_character
+			ss.stdin.Write([]byte{EOT})
 		}
-		ss.stdin.Close()
 	}()
 	go func() {
+		defer ss.stdout.Close()
 		_, err := io.Copy(rec.writer("o", ss), ss.stdout)
-		if err != nil {
+		if err != nil && !errors.Is(err, io.EOF) {
 			logf("stdout copy: %v", err)
-			// If we got an error here, it's probably because the client has
-			// disconnected.
 			ss.ctx.CloseWithError(err)
+		} else {
+			ss.CloseWrite()
 		}
 	}()
 	// stderr is nil for ptys.
@@ -994,6 +1063,7 @@ func (ss *sshSession) run() {
 			}
 		}()
 	}
+
 	err = ss.cmd.Wait()
 	// This will either make the SSH Termination goroutine be a no-op,
 	// or itself will be a no-op because the process was killed by the
@@ -1001,6 +1071,7 @@ func (ss *sshSession) run() {
 	ss.exitOnce.Do(func() {})
 
 	if err == nil {
+		ss.logf("Session complete")
 		ss.Exit(0)
 		return
 	}
@@ -1029,10 +1100,10 @@ type sshConnInfo struct {
 	sshUser string
 
 	// src is the Tailscale IP and port that the connection came from.
-	src netaddr.IPPort
+	src netip.AddrPort
 
 	// dst is the Tailscale IP and port that the connection came for.
-	dst netaddr.IPPort
+	dst netip.AddrPort
 
 	// node is srcIP's node.
 	node *tailcfg.Node
@@ -1049,7 +1120,7 @@ func (c *conn) ruleExpired(r *tailcfg.SSHRule) bool {
 	if r.RuleExpires == nil {
 		return false
 	}
-	return r.RuleExpires.Before(c.now)
+	return r.RuleExpires.Before(c.srv.now())
 }
 
 func (c *conn) evalSSHPolicy(pol *tailcfg.SSHPolicy, pubKey gossh.PublicKey) (a *tailcfg.SSHAction, localUser string, ok bool) {
@@ -1068,9 +1139,20 @@ var (
 	errRuleExpired    = errors.New("rule expired")
 	errPrincipalMatch = errors.New("principal didn't match")
 	errUserMatch      = errors.New("user didn't match")
+	errInvalidConn    = errors.New("invalid connection state")
 )
 
 func (c *conn) matchRule(r *tailcfg.SSHRule, pubKey gossh.PublicKey) (a *tailcfg.SSHAction, localUser string, err error) {
+	if c == nil {
+		return nil, "", errInvalidConn
+	}
+	c.mu.Lock()
+	ci := c.info
+	c.mu.Unlock()
+	if ci == nil {
+		c.logf("invalid connection state")
+		return nil, "", errInvalidConn
+	}
 	if r == nil {
 		return nil, "", errNilRule
 	}
@@ -1084,7 +1166,7 @@ func (c *conn) matchRule(r *tailcfg.SSHRule, pubKey gossh.PublicKey) (a *tailcfg
 		// For all but Reject rules, SSHUsers is required.
 		// If SSHUsers is nil or empty, mapLocalUser will return an
 		// empty string anyway.
-		localUser = mapLocalUser(r.SSHUsers, c.info.sshUser)
+		localUser = mapLocalUser(r.SSHUsers, ci.sshUser)
 		if localUser == "" {
 			return nil, "", errUserMatch
 		}
@@ -1133,7 +1215,9 @@ func (c *conn) principalMatches(p *tailcfg.SSHPrincipal, pubKey gossh.PublicKey)
 // that match the Tailscale identity match (Node, NodeIP, UserLogin, Any).
 // This function does not consider PubKeys.
 func (c *conn) principalMatchesTailscaleIdentity(p *tailcfg.SSHPrincipal) bool {
+	c.mu.Lock()
 	ci := c.info
+	c.mu.Unlock()
 	if p.Any {
 		return true
 	}
@@ -1141,7 +1225,7 @@ func (c *conn) principalMatchesTailscaleIdentity(p *tailcfg.SSHPrincipal) bool {
 		return true
 	}
 	if p.NodeIP != "" {
-		if ip, _ := netaddr.ParseIP(p.NodeIP); ip == ci.src.IP() {
+		if ip, _ := netip.ParseAddr(p.NodeIP); ip == ci.src.Addr() {
 			return true
 		}
 	}

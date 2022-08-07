@@ -8,11 +8,11 @@ package netmap
 import (
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"strings"
 	"time"
 
-	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/wgengine/filter"
@@ -31,8 +31,7 @@ type NetworkMap struct {
 	Expiry     time.Time
 	// Name is the DNS name assigned to this node.
 	Name          string
-	Addresses     []netaddr.IPPrefix // same as tailcfg.Node.Addresses (IP addresses of this Node directly)
-	LocalPort     uint16             // used for debugging
+	Addresses     []netip.Prefix // same as tailcfg.Node.Addresses (IP addresses of this Node directly)
 	MachineStatus tailcfg.MachineStatus
 	MachineKey    key.MachinePublic
 	Peers         []*tailcfg.Node // sorted by Node.ID
@@ -75,14 +74,14 @@ type NetworkMap struct {
 // PeerByTailscaleIP returns a peer's Node based on its Tailscale IP.
 //
 // If nm is nil or no peer is found, ok is false.
-func (nm *NetworkMap) PeerByTailscaleIP(ip netaddr.IP) (peer *tailcfg.Node, ok bool) {
+func (nm *NetworkMap) PeerByTailscaleIP(ip netip.Addr) (peer *tailcfg.Node, ok bool) {
 	// TODO(bradfitz):
 	if nm == nil {
 		return nil, false
 	}
 	for _, n := range nm.Peers {
 		for _, a := range n.Addresses {
-			if a.IP() == ip {
+			if a.Addr() == ip {
 				return n, true
 			}
 		}
@@ -148,9 +147,6 @@ func (nm *NetworkMap) printConciseHeader(buf *strings.Builder) {
 		}
 	}
 	fmt.Fprintf(buf, " u=%s", login)
-	if nm.LocalPort != 0 {
-		fmt.Fprintf(buf, " port=%v", nm.LocalPort)
-	}
 	if nm.Debug != nil {
 		j, _ := json.Marshal(nm.Debug)
 		fmt.Fprintf(buf, " debug=%s", j)
@@ -164,7 +160,6 @@ func (nm *NetworkMap) printConciseHeader(buf *strings.Builder) {
 func (a *NetworkMap) equalConciseHeader(b *NetworkMap) bool {
 	if a.NodeKey != b.NodeKey ||
 		a.MachineStatus != b.MachineStatus ||
-		a.LocalPort != b.LocalPort ||
 		a.User != b.User ||
 		len(a.Addresses) != len(b.Addresses) {
 		return false
@@ -310,7 +305,7 @@ func eqStringsIgnoreNil(a, b []string) bool {
 
 // eqCIDRsIgnoreNil reports whether a and b have the same length and
 // contents, but ignore whether a or b are nil.
-func eqCIDRsIgnoreNil(a, b []netaddr.IPPrefix) bool {
+func eqCIDRsIgnoreNil(a, b []netip.Prefix) bool {
 	if len(a) != len(b) {
 		return false
 	}

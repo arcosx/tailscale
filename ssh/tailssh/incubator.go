@@ -86,8 +86,11 @@ func (ss *sshSession) newIncubatorCommand() *exec.Cmd {
 		// TODO(maisem): this doesn't work with sftp
 		return exec.CommandContext(ss.ctx, name, args...)
 	}
+	ss.conn.mu.Lock()
 	lu := ss.conn.localUser
 	ci := ss.conn.info
+	gids := strings.Join(ss.conn.userGroupIDs, ",")
+	ss.conn.mu.Unlock()
 	remoteUser := ci.uprof.LoginName
 	if len(ci.node.Tags) > 0 {
 		remoteUser = strings.Join(ci.node.Tags, ",")
@@ -98,10 +101,10 @@ func (ss *sshSession) newIncubatorCommand() *exec.Cmd {
 		"ssh",
 		"--uid=" + lu.Uid,
 		"--gid=" + lu.Gid,
-		"--groups=" + strings.Join(ss.conn.userGroupIDs, ","),
+		"--groups=" + gids,
 		"--local-user=" + lu.Username,
 		"--remote-user=" + remoteUser,
-		"--remote-ip=" + ci.src.IP().String(),
+		"--remote-ip=" + ci.src.Addr().String(),
 		"--has-tty=false", // updated in-place by startWithPTY
 		"--tty-name=",     // updated in-place by startWithPTY
 	}
@@ -206,7 +209,7 @@ func beIncubator(args []string) error {
 		// If we are trying to launch a login shell, just exec into login
 		// instead. We can only do this if a TTY was requested, otherwise login
 		// exits immediately, which breaks things likes mosh and VSCode.
-		return unix.Exec(ia.loginCmdPath, []string{ia.loginCmdPath, "-f", ia.localUser, "-h", ia.remoteIP, "-p"}, os.Environ())
+		return unix.Exec(ia.loginCmdPath, ia.loginArgs(), os.Environ())
 	}
 
 	// Inform the system that we are about to log someone in.
@@ -225,7 +228,8 @@ func beIncubator(args []string) error {
 		}
 		groupIDs = append(groupIDs, int(gid))
 	}
-	if err := syscall.Setgroups(groupIDs); err != nil {
+
+	if err := setGroups(groupIDs); err != nil {
 		return err
 	}
 	if egid := os.Getegid(); egid != ia.gid {
@@ -291,8 +295,8 @@ func (ss *sshSession) launchProcess() error {
 
 	ci := ss.conn.info
 	cmd.Env = append(cmd.Env,
-		fmt.Sprintf("SSH_CLIENT=%s %d %d", ci.src.IP(), ci.src.Port(), ci.dst.Port()),
-		fmt.Sprintf("SSH_CONNECTION=%s %d %s %d", ci.src.IP(), ci.src.Port(), ci.dst.IP(), ci.dst.Port()),
+		fmt.Sprintf("SSH_CLIENT=%s %d %d", ci.src.Addr(), ci.src.Port(), ci.dst.Port()),
+		fmt.Sprintf("SSH_CONNECTION=%s %d %s %d", ci.src.Addr(), ci.src.Port(), ci.dst.Addr(), ci.dst.Port()),
 	)
 
 	if ss.agentListener != nil {
@@ -309,15 +313,25 @@ func (ss *sshSession) launchProcess() error {
 	if err != nil {
 		return err
 	}
-	go resizeWindow(pty, winCh)
-	ss.stdout = pty // no stderr for a pty
+
+	// We need to be able to close stdin and stdout separately later so make a
+	// dup.
+	ptyDup, err := syscall.Dup(int(pty.Fd()))
+	if err != nil {
+		return err
+	}
+	go resizeWindow(ptyDup /* arbitrary fd */, winCh)
+
 	ss.stdin = pty
+	ss.stdout = os.NewFile(uintptr(ptyDup), pty.Name())
+	ss.stderr = nil // not available for pty
+
 	return nil
 }
 
-func resizeWindow(f *os.File, winCh <-chan ssh.Window) {
+func resizeWindow(fd int, winCh <-chan ssh.Window) {
 	for win := range winCh {
-		unix.IoctlSetWinsize(int(f.Fd()), syscall.TIOCSWINSZ, &unix.Winsize{
+		unix.IoctlSetWinsize(fd, syscall.TIOCSWINSZ, &unix.Winsize{
 			Row: uint16(win.Height),
 			Col: uint16(win.Width),
 		})

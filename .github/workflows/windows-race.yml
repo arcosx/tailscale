@@ -19,7 +19,7 @@ jobs:
     - name: Install Go
       uses: actions/setup-go@v3
       with:
-        go-version: 1.18.x
+        go-version: 1.19.x
 
     - name: Checkout code
       uses: actions/checkout@v3
@@ -42,6 +42,17 @@ jobs:
         # differ in most by volume (build cache).
         # TODO(raggi): add a go version here.
         key: ${{ runner.os }}-go-2-race-${{ hashFiles('**/go.sum') }}
+
+    - name: Print toolchain details
+      run: gcc -v
+
+    # There is currently an issue in the race detector in Go on Windows when
+    # used with a newer version of GCC.
+    # See https://github.com/tailscale/tailscale/issues/4926.
+    - name: Downgrade MinGW
+      shell: bash
+      run: |
+        choco install mingw --version 10.2.0 --allow-downgrade
 
     - name: Test with -race flag
       # Don't use -bench=. -benchtime=1x.

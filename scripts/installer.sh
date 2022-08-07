@@ -191,7 +191,7 @@ main() {
 				VERSION="tumbleweed"
 				PACKAGETYPE="zypper"
 				;;
-			arch)
+			arch|archarm)
 				OS="$ID"
 				VERSION="" # rolling release
 				PACKAGETYPE="pacman"
@@ -292,7 +292,8 @@ main() {
 			fi
 		;;
 		raspbian)
-			if [ "$VERSION" != "buster" ] && \
+			if [ "$VERSION" != "stretch" ] && \
+			   [ "$VERSION" != "buster" ] && \
 			   [ "$VERSION" != "bullseye" ]
 			then
 				OS_UNSUPPORTED=1
@@ -502,8 +503,15 @@ main() {
 			;;
 		pacman)
 			set -x
-			$SUDO pacman -S tailscale
+			$SUDO pacman -S tailscale --noconfirm
 			$SUDO systemctl enable --now tailscaled
+			set +x
+			;;
+		pkg)
+			set -x
+			$SUDO pkg install tailscale
+			$SUDO service tailscaled enable
+			$SUDO service tailscaled start
 			set +x
 			;;
 		apk)

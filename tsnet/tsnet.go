@@ -10,17 +10,18 @@ package tsnet
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"inet.af/netaddr"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/control/controlclient"
 	"tailscale.com/envknob"
@@ -74,6 +75,13 @@ type Server struct {
 	// as an Ephemeral node (https://tailscale.com/kb/1111/ephemeral-nodes/).
 	Ephemeral bool
 
+	// AuthKey, if non-empty, is the auth key to create the node
+	// and will be preferred over the TS_AUTHKEY environment
+	// variable. If the node is already created (from state
+	// previously stored in in Store), then this field is not
+	// used.
+	AuthKey string
+
 	initOnce         sync.Once
 	initErr          error
 	lb               *ipnlocal.LocalBackend
@@ -84,6 +92,7 @@ type Server struct {
 	shutdownCtx      context.Context
 	shutdownCancel   context.CancelFunc
 	localClient      *tailscale.LocalClient
+	logbuffer        *filch.Filch
 	logtail          *logtail.Logger
 
 	mu        sync.Mutex
@@ -123,6 +132,26 @@ func (s *Server) Start() error {
 //
 // It must not be called before or concurrently with Start.
 func (s *Server) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Perform a best-effort final flush.
+		s.logtail.Shutdown(ctx)
+		s.logbuffer.Close()
+	}()
+
+	if _, isMemStore := s.Store.(*mem.Store); isMemStore && s.Ephemeral {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Perform a best-effort logout.
+			s.lb.LogoutSync(ctx)
+		}()
+	}
+
 	s.shutdownCancel()
 	s.lb.Shutdown()
 	s.linkMon.Close()
@@ -136,11 +165,7 @@ func (s *Server) Close() error {
 	}
 	s.listeners = nil
 
-	// Perform a best-effort final flush.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	s.logtail.Shutdown(ctx)
-
+	wg.Wait()
 	return nil
 }
 
@@ -151,7 +176,17 @@ func (s *Server) doInit() {
 	}
 }
 
-func (s *Server) start() error {
+func (s *Server) getAuthKey() string {
+	if v := s.AuthKey; v != "" {
+		return v
+	}
+	return os.Getenv("TS_AUTHKEY")
+}
+
+func (s *Server) start() (reterr error) {
+	var closePool closeOnErrorPool
+	defer closePool.closeAllIfError(&reterr)
+
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -209,15 +244,16 @@ func (s *Server) start() error {
 	}
 	logid := lpc.PublicID.String()
 
-	f, err := filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
+	s.logbuffer, err = filch.New(filepath.Join(s.rootPath, "tailscaled"), filch.Options{ReplaceStderr: false})
 	if err != nil {
 		return fmt.Errorf("error creating filch: %w", err)
 	}
+	closePool.add(s.logbuffer)
 	c := logtail.Config{
 		Collection: lpc.Collection,
 		PrivateID:  lpc.PrivateID,
 		Stderr:     ioutil.Discard, // log everything to Buffer
-		Buffer:     f,
+		Buffer:     s.logbuffer,
 		NewZstdEncoder: func() logtail.Encoder {
 			w, err := smallzstd.NewEncoder(nil)
 			if err != nil {
@@ -228,11 +264,13 @@ func (s *Server) start() error {
 		HTTPC: &http.Client{Transport: logpolicy.NewLogtailTransport(logtail.DefaultHost)},
 	}
 	s.logtail = logtail.NewLogger(c, logf)
+	closePool.addFunc(func() { s.logtail.Shutdown(context.Background()) })
 
 	s.linkMon, err = monitor.New(logf)
 	if err != nil {
 		return err
 	}
+	closePool.add(s.linkMon)
 
 	s.dialer = new(tsdial.Dialer) // mutated below (before used)
 	eng, err := wgengine.NewUserspaceEngine(logf, wgengine.Config{
@@ -243,6 +281,7 @@ func (s *Server) start() error {
 	if err != nil {
 		return err
 	}
+	closePool.add(s.dialer)
 
 	tunDev, magicConn, dns, ok := eng.(wgengine.InternalsGetter).GetInternals()
 	if !ok {
@@ -258,11 +297,11 @@ func (s *Server) start() error {
 	if err := ns.Start(); err != nil {
 		return fmt.Errorf("failed to start netstack: %w", err)
 	}
-	s.dialer.UseNetstackForIP = func(ip netaddr.IP) bool {
+	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		_, ok := eng.PeerForIP(ip)
 		return ok
 	}
-	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netaddr.IPPort) (net.Conn, error) {
+	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		return ns.DialContextTCP(ctx, dst)
 	}
 
@@ -286,13 +325,14 @@ func (s *Server) start() error {
 	lb.SetVarRoot(s.rootPath)
 	logf("tsnet starting with hostname %q, varRoot %q", s.hostname, s.rootPath)
 	s.lb = lb
+	closePool.addFunc(func() { s.lb.Shutdown() })
 	lb.SetDecompressor(func() (controlclient.Decompressor, error) {
 		return smallzstd.NewDecoder(nil)
 	})
 	prefs := ipn.NewPrefs()
 	prefs.Hostname = s.hostname
 	prefs.WantRunning = true
-	authKey := os.Getenv("TS_AUTHKEY")
+	authKey := s.getAuthKey()
 	err = lb.Start(ipn.Options{
 		StateKey:    ipn.GlobalDaemonStateKey,
 		UpdatePrefs: prefs,
@@ -306,7 +346,7 @@ func (s *Server) start() error {
 		logf("LocalBackend state is %v; running StartLoginInteractive...", st)
 		s.lb.StartLoginInteractive()
 	} else if authKey != "" {
-		logf("TS_AUTHKEY is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
+		logf("Authkey is set; but state is %v. Ignoring authkey. Re-run with TSNET_FORCE_LOGIN=1 to force use of authkey.", st)
 	}
 	go s.printAuthURLLoop()
 
@@ -326,7 +366,20 @@ func (s *Server) start() error {
 			logf("localapi serve error: %v", err)
 		}
 	}()
+	closePool.add(s.localAPIListener)
 	return nil
+}
+
+type closeOnErrorPool []func()
+
+func (p *closeOnErrorPool) add(c io.Closer)   { *p = append(*p, func() { c.Close() }) }
+func (p *closeOnErrorPool) addFunc(fn func()) { *p = append(*p, fn) }
+func (p closeOnErrorPool) closeAllIfError(errp *error) {
+	if *errp != nil {
+		for _, closeFn := range p {
+			closeFn()
+		}
+	}
 }
 
 func (s *Server) logf(format string, a ...interface{}) {

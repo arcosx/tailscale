@@ -7,6 +7,7 @@ package interfaces
 import (
 	"log"
 	"net"
+	"net/netip"
 	"net/url"
 	"strings"
 	"syscall"
@@ -14,7 +15,6 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-	"inet.af/netaddr"
 	"tailscale.com/tsconst"
 )
 
@@ -27,7 +27,7 @@ func init() {
 	getPAC = getPACWindows
 }
 
-func likelyHomeRouterIPWindows() (ret netaddr.IP, ok bool) {
+func likelyHomeRouterIPWindows() (ret netip.Addr, ok bool) {
 	rs, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
 	if err != nil {
 		log.Printf("routerIP/GetIPForwardTable2 error: %v", err)
@@ -64,11 +64,12 @@ func likelyHomeRouterIPWindows() (ret netaddr.IP, ok bool) {
 			continue
 		}
 
-		ip, ok := netaddr.FromStdIP(r.NextHop.IP())
+		ip, ok := netip.AddrFromSlice(r.NextHop.IP())
 		if !ok {
 			// Not a valid gateway, so skip (won't happen though)
 			continue
 		}
+		ip = ip.Unmap()
 
 		if best == nil {
 			best = r
@@ -92,12 +93,12 @@ func likelyHomeRouterIPWindows() (ret netaddr.IP, ok bool) {
 		}
 	}
 
-	if !ret.IsZero() && !ret.IsPrivate() {
+	if ret.IsValid() && !ret.IsPrivate() {
 		// Default route has a non-private gateway
-		return netaddr.IP{}, false
+		return netip.Addr{}, false
 	}
 
-	return ret, !ret.IsZero()
+	return ret, ret.IsValid()
 }
 
 // NonTailscaleMTUs returns a map of interface LUID to interface MTU,

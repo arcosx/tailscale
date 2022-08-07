@@ -10,17 +10,24 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"math"
+	"math/rand"
+	"net/netip"
 	"reflect"
 	"runtime"
 	"testing"
+	"testing/quick"
+	"time"
+	"unsafe"
 
 	"go4.org/mem"
-	"inet.af/netaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
+	"tailscale.com/types/structs"
+	"tailscale.com/util/deephash/testtype"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
@@ -56,6 +63,7 @@ func TestHash(t *testing.T) {
 	}
 	type MyBool bool
 	type MyHeader tar.Header
+	var zeroFloat64 float64
 	tests := []struct {
 		in     tuple
 		wantEq bool
@@ -97,6 +105,10 @@ func TestHash(t *testing.T) {
 		{in: tuple{iface{&MyHeader{}}, iface{&tar.Header{}}}, wantEq: false},
 		{in: tuple{iface{[]map[string]MyBool{}}, iface{[]map[string]MyBool{}}}, wantEq: true},
 		{in: tuple{iface{[]map[string]bool{}}, iface{[]map[string]MyBool{}}}, wantEq: false},
+		{in: tuple{zeroFloat64, -zeroFloat64}, wantEq: false}, // Issue 4883 (false alarm)
+		{in: tuple{[]any(nil), 0.0}, wantEq: false},           // Issue 4883
+		{in: tuple{[]any(nil), uint8(0)}, wantEq: false},      // Issue 4883
+		{in: tuple{nil, nil}, wantEq: true},                   // Issue 4883
 		{
 			in: func() tuple {
 				i1 := 1
@@ -112,7 +124,7 @@ func TestHash(t *testing.T) {
 	for _, tt := range tests {
 		gotEq := Hash(tt.in[0]) == Hash(tt.in[1])
 		if gotEq != tt.wantEq {
-			t.Errorf("(Hash(%v) == Hash(%v)) = %v, want %v", tt.in[0], tt.in[1], gotEq, tt.wantEq)
+			t.Errorf("(Hash(%T %v) == Hash(%T %v)) = %v, want %v", tt.in[0], tt.in[0], tt.in[1], tt.in[1], gotEq, tt.wantEq)
 		}
 	}
 }
@@ -132,11 +144,54 @@ func TestDeepHash(t *testing.T) {
 	}
 }
 
+// Tests that we actually hash map elements. Whoops.
+func TestIssue4868(t *testing.T) {
+	m1 := map[int]string{1: "foo"}
+	m2 := map[int]string{1: "bar"}
+	if Hash(m1) == Hash(m2) {
+		t.Error("bogus")
+	}
+}
+
+func TestIssue4871(t *testing.T) {
+	m1 := map[string]string{"": "", "x": "foo"}
+	m2 := map[string]string{}
+	if h1, h2 := Hash(m1), Hash(m2); h1 == h2 {
+		t.Errorf("bogus: h1=%x, h2=%x", h1, h2)
+	}
+}
+
+func TestNilVsEmptymap(t *testing.T) {
+	m1 := map[string]string(nil)
+	m2 := map[string]string{}
+	if h1, h2 := Hash(m1), Hash(m2); h1 == h2 {
+		t.Errorf("bogus: h1=%x, h2=%x", h1, h2)
+	}
+}
+
+func TestMapFraming(t *testing.T) {
+	m1 := map[string]string{"foo": "", "fo": "o"}
+	m2 := map[string]string{}
+	if h1, h2 := Hash(m1), Hash(m2); h1 == h2 {
+		t.Errorf("bogus: h1=%x, h2=%x", h1, h2)
+	}
+}
+
+func TestQuick(t *testing.T) {
+	initSeed()
+	err := quick.Check(func(v, w map[string]string) bool {
+		return (Hash(v) == Hash(w)) == reflect.DeepEqual(v, w)
+	}, &quick.Config{MaxCount: 1000, Rand: rand.New(rand.NewSource(int64(seed)))})
+	if err != nil {
+		t.Fatalf("seed=%v, err=%v", seed, err)
+	}
+}
+
 func getVal() []any {
 	return []any{
 		&wgcfg.Config{
 			Name:      "foo",
-			Addresses: []netaddr.IPPrefix{netaddr.IPPrefixFrom(netaddr.IPFrom16([16]byte{3: 3}), 5)},
+			Addresses: []netip.Prefix{netip.PrefixFrom(netip.AddrFrom16([16]byte{3: 3}).Unmap(), 5)},
 			Peers: []wgcfg.Peer{
 				{
 					PublicKey: key.NodePublic{},
@@ -144,25 +199,25 @@ func getVal() []any {
 			},
 		},
 		&router.Config{
-			Routes: []netaddr.IPPrefix{
-				netaddr.MustParseIPPrefix("1.2.3.0/24"),
-				netaddr.MustParseIPPrefix("1234::/64"),
+			Routes: []netip.Prefix{
+				netip.MustParsePrefix("1.2.3.0/24"),
+				netip.MustParsePrefix("1234::/64"),
 			},
 		},
-		map[dnsname.FQDN][]netaddr.IP{
-			dnsname.FQDN("a."): {netaddr.MustParseIP("1.2.3.4"), netaddr.MustParseIP("4.3.2.1")},
-			dnsname.FQDN("b."): {netaddr.MustParseIP("8.8.8.8"), netaddr.MustParseIP("9.9.9.9")},
-			dnsname.FQDN("c."): {netaddr.MustParseIP("6.6.6.6"), netaddr.MustParseIP("7.7.7.7")},
-			dnsname.FQDN("d."): {netaddr.MustParseIP("6.7.6.6"), netaddr.MustParseIP("7.7.7.8")},
-			dnsname.FQDN("e."): {netaddr.MustParseIP("6.8.6.6"), netaddr.MustParseIP("7.7.7.9")},
-			dnsname.FQDN("f."): {netaddr.MustParseIP("6.9.6.6"), netaddr.MustParseIP("7.7.7.0")},
+		map[dnsname.FQDN][]netip.Addr{
+			dnsname.FQDN("a."): {netip.MustParseAddr("1.2.3.4"), netip.MustParseAddr("4.3.2.1")},
+			dnsname.FQDN("b."): {netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("9.9.9.9")},
+			dnsname.FQDN("c."): {netip.MustParseAddr("6.6.6.6"), netip.MustParseAddr("7.7.7.7")},
+			dnsname.FQDN("d."): {netip.MustParseAddr("6.7.6.6"), netip.MustParseAddr("7.7.7.8")},
+			dnsname.FQDN("e."): {netip.MustParseAddr("6.8.6.6"), netip.MustParseAddr("7.7.7.9")},
+			dnsname.FQDN("f."): {netip.MustParseAddr("6.9.6.6"), netip.MustParseAddr("7.7.7.0")},
 		},
-		map[dnsname.FQDN][]netaddr.IPPort{
-			dnsname.FQDN("a."): {netaddr.MustParseIPPort("1.2.3.4:11"), netaddr.MustParseIPPort("4.3.2.1:22")},
-			dnsname.FQDN("b."): {netaddr.MustParseIPPort("8.8.8.8:11"), netaddr.MustParseIPPort("9.9.9.9:22")},
-			dnsname.FQDN("c."): {netaddr.MustParseIPPort("8.8.8.8:12"), netaddr.MustParseIPPort("9.9.9.9:23")},
-			dnsname.FQDN("d."): {netaddr.MustParseIPPort("8.8.8.8:13"), netaddr.MustParseIPPort("9.9.9.9:24")},
-			dnsname.FQDN("e."): {netaddr.MustParseIPPort("8.8.8.8:14"), netaddr.MustParseIPPort("9.9.9.9:25")},
+		map[dnsname.FQDN][]netip.AddrPort{
+			dnsname.FQDN("a."): {netip.MustParseAddrPort("1.2.3.4:11"), netip.MustParseAddrPort("4.3.2.1:22")},
+			dnsname.FQDN("b."): {netip.MustParseAddrPort("8.8.8.8:11"), netip.MustParseAddrPort("9.9.9.9:22")},
+			dnsname.FQDN("c."): {netip.MustParseAddrPort("8.8.8.8:12"), netip.MustParseAddrPort("9.9.9.9:23")},
+			dnsname.FQDN("d."): {netip.MustParseAddrPort("8.8.8.8:13"), netip.MustParseAddrPort("9.9.9.9:24")},
+			dnsname.FQDN("e."): {netip.MustParseAddrPort("8.8.8.8:14"), netip.MustParseAddrPort("9.9.9.9:25")},
 		},
 		map[key.DiscoPublic]bool{
 			key.DiscoPublicFromRaw32(mem.B([]byte{1: 1, 31: 0})): true,
@@ -226,6 +281,365 @@ func getVal() []any {
 	}
 }
 
+func TestTypeIsRecursive(t *testing.T) {
+	type RecursiveStruct struct {
+		v *RecursiveStruct
+	}
+	type RecursiveChan chan *RecursiveChan
+
+	tests := []struct {
+		val  any
+		want bool
+	}{
+		{val: 42, want: false},
+		{val: "string", want: false},
+		{val: 1 + 2i, want: false},
+		{val: struct{}{}, want: false},
+		{val: (*RecursiveStruct)(nil), want: true},
+		{val: RecursiveStruct{}, want: true},
+		{val: time.Unix(0, 0), want: false},
+		{val: structs.Incomparable{}, want: false}, // ignore its [0]func()
+		{val: tailcfg.NetPortRange{}, want: false}, // uses structs.Incomparable
+		{val: (*tailcfg.Node)(nil), want: false},
+		{val: map[string]bool{}, want: false},
+		{val: func() {}, want: false},
+		{val: make(chan int), want: false},
+		{val: unsafe.Pointer(nil), want: false},
+		{val: make(RecursiveChan), want: true},
+		{val: make(chan int), want: false},
+	}
+	for _, tt := range tests {
+		got := typeIsRecursive(reflect.TypeOf(tt.val))
+		if got != tt.want {
+			t.Errorf("for type %T: got %v, want %v", tt.val, got, tt.want)
+		}
+	}
+}
+
+type IntThenByte struct {
+	i int
+	b byte
+}
+
+type TwoInts struct{ a, b int }
+
+type IntIntByteInt struct {
+	i1, i2 int32
+	b      byte // padding after
+	i3     int32
+}
+
+func TestCanMemHash(t *testing.T) {
+	tests := []struct {
+		val  any
+		want bool
+	}{
+		{true, true},
+		{uint(1), true},
+		{uint8(1), true},
+		{uint16(1), true},
+		{uint32(1), true},
+		{uint64(1), true},
+		{uintptr(1), true},
+		{int(1), true},
+		{int8(1), true},
+		{int16(1), true},
+		{int32(1), true},
+		{int64(1), true},
+		{float32(1), true},
+		{float64(1), true},
+		{complex64(1), true},
+		{complex128(1), true},
+		{[32]byte{}, true},
+		{func() {}, false},
+		{make(chan int), false},
+		{struct{ io.Writer }{nil}, false},
+		{unsafe.Pointer(nil), false},
+		{new(int), false},
+		{TwoInts{}, true},
+		{[4]TwoInts{}, true},
+		{IntThenByte{}, false},
+		{[4]IntThenByte{}, false},
+		{tailcfg.PortRange{}, true},
+		{int16(0), true},
+		{struct {
+			_ int
+			_ int
+		}{}, true},
+		{struct {
+			_ int
+			_ uint8
+			_ int
+		}{}, false}, // gap
+		{
+			struct {
+				_ structs.Incomparable // if not last, zero-width
+				x int
+			}{},
+			true,
+		},
+		{
+			struct {
+				x int
+				_ structs.Incomparable // zero-width last: has space, can't memhash
+			}{},
+			false,
+		}}
+	for _, tt := range tests {
+		got := canMemHash(reflect.TypeOf(tt.val))
+		if got != tt.want {
+			t.Errorf("for type %T: got %v, want %v", tt.val, got, tt.want)
+		}
+	}
+}
+
+func TestGetTypeHasher(t *testing.T) {
+	switch runtime.GOARCH {
+	case "amd64", "arm64", "arm", "386", "riscv64":
+	default:
+		// Test outputs below are specifically for little-endian machines.
+		// Just skip everything else for now. Feel free to add more above if
+		// you have the hardware to test and it's little-endian.
+		t.Skipf("skipping on %v", runtime.GOARCH)
+	}
+	type typedString string
+	var (
+		someInt        = int('A')
+		someComplex128 = complex128(1 + 2i)
+		someIP         = netip.MustParseAddr("1.2.3.4")
+	)
+	tests := []struct {
+		name  string
+		val   any
+		want  bool // set true automatically if out != ""
+		out   string
+		out32 string // overwrites out if 32-bit
+	}{
+		{
+			name: "int",
+			val:  int(1),
+			out:  "\x01\x00\x00\x00\x00\x00\x00\x00",
+		},
+		{
+			name: "int_negative",
+			val:  int(-1),
+			out:  "\xff\xff\xff\xff\xff\xff\xff\xff",
+		},
+		{
+			name: "int8",
+			val:  int8(1),
+			out:  "\x01",
+		},
+		{
+			name: "float64",
+			val:  float64(1.0),
+			out:  "\x00\x00\x00\x00\x00\x00\xf0?",
+		},
+		{
+			name: "float32",
+			val:  float32(1.0),
+			out:  "\x00\x00\x80?",
+		},
+		{
+			name: "string",
+			val:  "foo",
+			out:  "\x03\x00\x00\x00\x00\x00\x00\x00foo",
+		},
+		{
+			name: "typedString",
+			val:  typedString("foo"),
+			out:  "\x03\x00\x00\x00\x00\x00\x00\x00foo",
+		},
+		{
+			name: "string_slice",
+			val:  []string{"foo", "bar"},
+			out:  "\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x03\x00\x00\x00\x00\x00\x00\x00bar",
+		},
+		{
+			name:  "int_slice",
+			val:   []int{1, 0, -1},
+			out:   "\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff",
+			out32: "\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff",
+		},
+		{
+			name: "struct",
+			val: struct {
+				a, b int
+				c    uint16
+			}{1, -1, 2},
+			out: "\x01\x00\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff\xff\xff\xff\xff\x02\x00",
+		},
+		{
+			name: "nil_int_ptr",
+			val:  (*int)(nil),
+			out:  "\x00",
+		},
+		{
+			name:  "int_ptr",
+			val:   &someInt,
+			out:   "\x01A\x00\x00\x00\x00\x00\x00\x00",
+			out32: "\x01A\x00\x00\x00",
+		},
+		{
+			name: "nil_uint32_ptr",
+			val:  (*uint32)(nil),
+			out:  "\x00",
+		},
+		{
+			name: "complex128_ptr",
+			val:  &someComplex128,
+			out:  "\x01\x00\x00\x00\x00\x00\x00\xf0?\x00\x00\x00\x00\x00\x00\x00@",
+		},
+		{
+			name:  "packet_filter",
+			val:   filterRules,
+			out:   "\x04\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00*\v\x00\x00\x00\x00\x00\x00\x0010.1.3.4/32\v\x00\x00\x00\x00\x00\x00\x0010.0.0.0/24\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01 \x00\x00\x00\x00\x00\x00\x00\x01\x00\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+			out32: "\x04\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00*\v\x00\x00\x00\x00\x00\x00\x0010.1.3.4/32\v\x00\x00\x00\x00\x00\x00\x0010.0.0.0/24\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01 \x00\x00\x00\x01\x00\x02\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+		},
+		{
+			name: "netip.Addr",
+			val:  netip.MustParseAddr("fe80::123%foo"),
+			out:  "\r\x00\x00\x00\x00\x00\x00\x00fe80::123%foo",
+		},
+		{
+			name: "ptr-netip.Addr",
+			val:  &someIP,
+			out:  "\x01\a\x00\x00\x00\x00\x00\x00\x001.2.3.4",
+		},
+		{
+			name: "ptr-nil-netip.Addr",
+			val:  (*netip.Addr)(nil),
+			out:  "\x00",
+		},
+		{
+			name: "time",
+			val:  time.Unix(0, 0).In(time.UTC),
+			out:  "\x141970-01-01T00:00:00Z",
+		},
+		{
+			name: "time_ptr", // addressable, as opposed to "time" test above
+			val:  ptrTo(time.Unix(0, 0).In(time.UTC)),
+			out:  "\x01\x141970-01-01T00:00:00Z",
+		},
+		{
+			name: "time_ptr_via_unexported",
+			val:  testtype.NewUnexportedAddressableTime(time.Unix(0, 0).In(time.UTC)),
+			out:  "\x01\x141970-01-01T00:00:00Z",
+		},
+		{
+			name: "time_ptr_via_unexported_value",
+			val:  *testtype.NewUnexportedAddressableTime(time.Unix(0, 0).In(time.UTC)),
+			want: false, // neither addressable nor interface-able
+		},
+		{
+			name: "time_custom_zone",
+			val:  time.Unix(1655311822, 0).In(time.FixedZone("FOO", -60*60)),
+			out:  "\x192022-06-15T15:50:22-01:00",
+		},
+		{
+			name: "time_nil",
+			val:  (*time.Time)(nil),
+			out:  "\x00",
+		},
+		{
+			name: "array_memhash",
+			val:  [4]byte{1, 2, 3, 4},
+			out:  "\x01\x02\x03\x04",
+		},
+		{
+			name: "array_ptr_memhash",
+			val:  ptrTo([4]byte{1, 2, 3, 4}),
+			out:  "\x01\x01\x02\x03\x04",
+		},
+		{
+			name: "ptr_to_struct_partially_memhashable",
+			val: &struct {
+				A int16
+				B int16
+				C *int
+			}{5, 6, nil},
+			out: "\x01\x05\x00\x06\x00\x00",
+		},
+		{
+			name: "struct_partially_memhashable_but_cant_addr",
+			val: struct {
+				A int16
+				B int16
+				C *int
+			}{5, 6, nil},
+			out: "\x05\x00\x06\x00\x00",
+		},
+		{
+			name: "array_elements",
+			val:  [4]byte{1, 2, 3, 4},
+			out:  "\x01\x02\x03\x04",
+		},
+		{
+			name: "bool",
+			val:  true,
+			out:  "\x01",
+		},
+		{
+			name: "IntIntByteInt",
+			val:  IntIntByteInt{1, 2, 3, 4},
+			out:  "\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00",
+		},
+		{
+			name: "IntIntByteInt-canddr",
+			val:  &IntIntByteInt{1, 2, 3, 4},
+			out:  "\x01\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00",
+		},
+		{
+			name: "array-IntIntByteInt",
+			val: [2]IntIntByteInt{
+				{1, 2, 3, 4},
+				{5, 6, 7, 8},
+			},
+			out: "\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00\x05\x00\x00\x00\x06\x00\x00\x00\a\b\x00\x00\x00",
+		},
+		{
+			name: "array-IntIntByteInt-canaddr",
+			val: &[2]IntIntByteInt{
+				{1, 2, 3, 4},
+				{5, 6, 7, 8},
+			},
+			out: "\x01\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00\x05\x00\x00\x00\x06\x00\x00\x00\a\b\x00\x00\x00",
+		},
+		{
+			name: "tailcfg.Node",
+			val:  &tailcfg.Node{},
+			out:  "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x140001-01-01T00:00:00Z\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x140001-01-01T00:00:00Z\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rv := reflect.ValueOf(tt.val)
+			fn := getTypeInfo(rv.Type()).hasher()
+			var buf bytes.Buffer
+			h := &hasher{
+				bw: bufio.NewWriter(&buf),
+			}
+			got := fn(h, rv)
+			const ptrSize = 32 << uintptr(^uintptr(0)>>63)
+			if tt.out32 != "" && ptrSize == 32 {
+				tt.out = tt.out32
+			}
+			if tt.out != "" {
+				tt.want = true
+			}
+			if got != tt.want {
+				t.Fatalf("func returned %v; want %v", got, tt.want)
+			}
+			if err := h.bw.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			if got := buf.String(); got != tt.out {
+				t.Fatalf("got %q; want %q", got, tt.out)
+			}
+		})
+	}
+}
+
 var sink = Hash("foo")
 
 func BenchmarkHash(b *testing.B) {
@@ -233,6 +647,58 @@ func BenchmarkHash(b *testing.B) {
 	v := getVal()
 	for i := 0; i < b.N; i++ {
 		sink = Hash(v)
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }
+
+// filterRules is a packet filter that has both everything populated (in its
+// first element) and also a few entries that are the typical shape for regular
+// packet filters as sent to clients.
+var filterRules = []tailcfg.FilterRule{
+	{
+		SrcIPs:  []string{"*", "10.1.3.4/32", "10.0.0.0/24"},
+		SrcBits: []int{1, 2, 3},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "1.2.3.4/32",
+			Bits:  ptrTo(32),
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+		IPProto: []int{1, 2, 3, 4},
+		CapGrant: []tailcfg.CapGrant{{
+			Dsts: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32")},
+			Caps: []string{"foo"},
+		}},
+	},
+	{
+		SrcIPs: []string{"foooooooooo"},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "baaaaaarrrrr",
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+	},
+	{
+		SrcIPs: []string{"foooooooooo"},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "baaaaaarrrrr",
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+	},
+	{
+		SrcIPs: []string{"foooooooooo"},
+		DstPorts: []tailcfg.NetPortRange{{
+			IP:    "baaaaaarrrrr",
+			Ports: tailcfg.PortRange{First: 1, Last: 2},
+		}},
+	},
+}
+
+func BenchmarkHashPacketFilter(b *testing.B) {
+	b.ReportAllocs()
+
+	hash := HasherForType[[]tailcfg.FilterRule]()
+	for i := 0; i < b.N; i++ {
+		sink = hash(filterRules)
 	}
 }
 
@@ -246,12 +712,14 @@ func TestHashMapAcyclic(t *testing.T) {
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
 
+	ti := getTypeInfo(reflect.TypeOf(m))
+
 	for i := 0; i < 20; i++ {
 		v := reflect.ValueOf(m)
 		buf.Reset()
 		bw.Reset(&buf)
 		h := &hasher{bw: bw}
-		h.hashMap(v)
+		h.hashMap(v, ti, false)
 		if got[string(buf.Bytes())] {
 			continue
 		}
@@ -270,7 +738,7 @@ func TestPrintArray(t *testing.T) {
 	var got bytes.Buffer
 	bw := bufio.NewWriter(&got)
 	h := &hasher{bw: bw}
-	h.hashValue(reflect.ValueOf(x))
+	h.hashValue(reflect.ValueOf(x), false)
 	bw.Flush()
 	const want = "\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x1f"
 	if got := got.Bytes(); string(got) != want {
@@ -288,13 +756,14 @@ func BenchmarkHashMapAcyclic(b *testing.B) {
 	var buf bytes.Buffer
 	bw := bufio.NewWriter(&buf)
 	v := reflect.ValueOf(m)
+	ti := getTypeInfo(v.Type())
 
 	h := &hasher{bw: bw}
 
 	for i := 0; i < b.N; i++ {
 		buf.Reset()
 		bw.Reset(&buf)
-		h.hashMap(v)
+		h.hashMap(v, ti, false)
 	}
 }
 
@@ -361,6 +830,26 @@ func TestArrayAllocs(t *testing.T) {
 	if got > want {
 		t.Errorf("allocs = %v; want %v", got, want)
 	}
+}
+
+// Test for http://go/corp/6311 issue.
+func TestHashThroughView(t *testing.T) {
+	type sshPolicyOut struct {
+		Rules []tailcfg.SSHRuleView
+	}
+	type mapResponseOut struct {
+		SSHPolicy *sshPolicyOut
+	}
+	// Just test we don't panic:
+	_ = Hash(&mapResponseOut{
+		SSHPolicy: &sshPolicyOut{
+			Rules: []tailcfg.SSHRuleView{
+				(&tailcfg.SSHRule{
+					RuleExpires: ptrTo(time.Unix(123, 0)),
+				}).View(),
+			},
+		},
+	})
 }
 
 func BenchmarkHashArray(b *testing.B) {

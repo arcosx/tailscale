@@ -11,23 +11,25 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"runtime"
 	"sort"
 	"time"
 
 	ole "github.com/go-ole/go-ole"
+	"go4.org/netipx"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-	"inet.af/netaddr"
 	"tailscale.com/health"
 	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/util/multierr"
 	"tailscale.com/wgengine/winnet"
 )
 
-var wintunLinkLocal = netaddr.MustParseIP("fe80::99d0:ec2d:b2e7:536b")
+var wintunLinkLocal = netip.MustParseAddr("fe80::99d0:ec2d:b2e7:536b")
 
 // monitorDefaultRoutes subscribes to route change events and updates
 // the Tailscale tunnel interface's MTU to match that of the
@@ -326,16 +328,16 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 	var firstGateway6 *net.IP
 	addresses := make([]*net.IPNet, 0, len(cfg.LocalAddrs))
 	for _, addr := range cfg.LocalAddrs {
-		if (addr.IP().Is4() && ipif4 == nil) || (addr.IP().Is6() && ipif6 == nil) {
+		if (addr.Addr().Is4() && ipif4 == nil) || (addr.Addr().Is6() && ipif6 == nil) {
 			// Can't program addresses for disabled protocol.
 			continue
 		}
-		ipnet := addr.IPNet()
+		ipnet := netipx.PrefixIPNet(addr)
 		addresses = append(addresses, ipnet)
 		gateway := ipnet.IP
-		if addr.IP().Is4() && firstGateway4 == nil {
+		if addr.Addr().Is4() && firstGateway4 == nil {
 			firstGateway4 = &gateway
-		} else if addr.IP().Is6() && firstGateway6 == nil {
+		} else if addr.Addr().Is6() && firstGateway6 == nil {
 			firstGateway6 = &gateway
 		}
 	}
@@ -344,31 +346,31 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 	foundDefault4 := false
 	foundDefault6 := false
 	for _, route := range cfg.Routes {
-		if (route.IP().Is4() && ipif4 == nil) || (route.IP().Is6() && ipif6 == nil) {
+		if (route.Addr().Is4() && ipif4 == nil) || (route.Addr().Is6() && ipif6 == nil) {
 			// Can't program routes for disabled protocol.
 			continue
 		}
 
-		if route.IP().Is6() && firstGateway6 == nil {
+		if route.Addr().Is6() && firstGateway6 == nil {
 			// Windows won't let us set IPv6 routes without having an
 			// IPv6 local address set. However, when we've configured
 			// a default route, we want to forcibly grab IPv6 traffic
 			// even if the v6 overlay network isn't configured. To do
 			// that, we add a dummy local IPv6 address to serve as a
 			// route source.
-			ipnet := &net.IPNet{tsaddr.Tailscale4To6Placeholder().IPAddr().IP, net.CIDRMask(128, 128)}
+			ipnet := &net.IPNet{tsaddr.Tailscale4To6Placeholder().AsSlice(), net.CIDRMask(128, 128)}
 			addresses = append(addresses, ipnet)
 			firstGateway6 = &ipnet.IP
-		} else if route.IP().Is4() && firstGateway4 == nil {
+		} else if route.Addr().Is4() && firstGateway4 == nil {
 			// TODO: do same dummy behavior as v6?
 			return errors.New("due to a Windows limitation, one cannot have interface routes without an interface address")
 		}
 
-		ipn := route.IPNet()
+		ipn := netipx.PrefixIPNet(route)
 		var gateway net.IP
-		if route.IP().Is4() {
+		if route.Addr().Is4() {
 			gateway = *firstGateway4
-		} else if route.IP().Is6() {
+		} else if route.Addr().Is6() {
 			gateway = *firstGateway6
 		}
 		r := winipcfg.RouteData{
@@ -387,12 +389,12 @@ func configureInterface(cfg *Config, tun *tun.NativeTun) (retErr error) {
 			// then the interface's IP won't be pingable.
 			continue
 		}
-		if route.IP().Is4() {
+		if route.Addr().Is4() {
 			if route.Bits() == 0 {
 				foundDefault4 = true
 			}
 			r.NextHop = *firstGateway4
-		} else if route.IP().Is6() {
+		} else if route.Addr().Is6() {
 			if route.Bits() == 0 {
 				foundDefault6 = true
 			}
@@ -574,26 +576,8 @@ func deltaNets(a, b []*net.IPNet) (add, del []*net.IPNet) {
 	return
 }
 
-func excludeIPv6LinkLocal(in []*net.IPNet) (out []*net.IPNet) {
-	out = in[:0]
-	for _, n := range in {
-		if len(n.IP) == 16 && n.IP.IsLinkLocalUnicast() {
-			// Windows creates a fixed link-local address for wintun,
-			// which doesn't seem to route correctly. Unfortunately, LLMNR returns this
-			// address for lookups by the hostname, and Windows prefers using it.
-			// This means that local traffic addressed to the machine's hostname breaks.
-			//
-			// While we otherwise preserve link-local addresses, we delete
-			// this one to force lookups to use a working address.
-			//
-			// See: https://github.com/tailscale/tailscale/issues/4647
-			if ip, ok := netaddr.FromStdIP(n.IP); !ok || wintunLinkLocal != ip {
-				continue // filter this IPNet
-			}
-		}
-		out = append(out, n)
-	}
-	return out
+func isIPv6LinkLocal(in *net.IPNet) bool {
+	return len(in.IP) == 16 && in.IP.IsLinkLocalUnicast()
 }
 
 // ipAdapterUnicastAddressToIPNet converts windows.IpAdapterUnicastAddress to net.IPNet.
@@ -622,14 +606,27 @@ func unicastIPNets(ifc *winipcfg.IPAdapterAddresses) []*net.IPNet {
 // doing the minimum number of AddAddresses & DeleteAddress calls.
 // This avoids the full FlushAddresses.
 //
-// Any IPv6 link-local addresses are not deleted.
+// Any IPv6 link-local addresses are not deleted out of caution as some
+// configurations may repeatedly re-add them. Link-local addresses are adjusted
+// to set SkipAsSource. SkipAsSource prevents the addresses from being addded to
+// DNS locally or remotely and from being picked as a source address for
+// outgoing packets with unspecified sources. See #4647 and
+// https://web.archive.org/web/20200912120956/https://devblogs.microsoft.com/scripting/use-powershell-to-change-ip-behavior-with-skipassource/
 func syncAddresses(ifc *winipcfg.IPAdapterAddresses, want []*net.IPNet) error {
 	var erracc error
 
 	got := unicastIPNets(ifc)
 	add, del := deltaNets(got, want)
-	del = excludeIPv6LinkLocal(del)
+
+	ll := make([]*net.IPNet, 0)
 	for _, a := range del {
+		// do not delete link-local addresses, and collect them for later
+		// applying SkipAsSource.
+		if isIPv6LinkLocal(a) {
+			ll = append(ll, a)
+			continue
+		}
+
 		err := ifc.LUID.DeleteIPAddress(*a)
 		if err != nil {
 			erracc = fmt.Errorf("deleting IP %q: %w", *a, err)
@@ -640,6 +637,20 @@ func syncAddresses(ifc *winipcfg.IPAdapterAddresses, want []*net.IPNet) error {
 		err := ifc.LUID.AddIPAddress(*a)
 		if err != nil {
 			erracc = fmt.Errorf("adding IP %q: %w", *a, err)
+		}
+	}
+
+	for _, a := range ll {
+		mib, err := ifc.LUID.IPAddress(a.IP)
+		if err != nil {
+			erracc = fmt.Errorf("setting skip-as-source on IP %q: unable to retrieve MIB: %w", *a, err)
+			continue
+		}
+		if !mib.SkipAsSource {
+			mib.SkipAsSource = true
+			if err := mib.Set(); err != nil {
+				erracc = fmt.Errorf("setting skip-as-source on IP %q: unable to set MIB: %w", *a, err)
+			}
 		}
 	}
 
@@ -757,8 +768,8 @@ func getAllInterfaceRoutes(ifc *winipcfg.IPAdapterAddresses) ([]*winipcfg.RouteD
 
 // filterRoutes removes routes that have been added by Windows and should not
 // be managed by us.
-func filterRoutes(routes []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) []*winipcfg.RouteData {
-	ddm := make(map[netaddr.IPPrefix]bool)
+func filterRoutes(routes []*winipcfg.RouteData, dontDelete []netip.Prefix) []*winipcfg.RouteData {
+	ddm := make(map[netip.Prefix]bool)
 	for _, dd := range dontDelete {
 		// See issue 1448: we don't want to touch the routes added
 		// by Windows for our interface addresses.
@@ -773,8 +784,8 @@ func filterRoutes(routes []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) [
 		if nr.IsSingleIP() {
 			continue
 		}
-		lastIP := nr.Range().To()
-		ddm[netaddr.IPPrefixFrom(lastIP, lastIP.BitLen())] = true
+		lastIP := netipx.RangeOfPrefix(nr).To()
+		ddm[netip.PrefixFrom(lastIP, lastIP.BitLen())] = true
 	}
 	filtered := make([]*winipcfg.RouteData, 0, len(routes))
 	for _, r := range routes {
@@ -791,7 +802,7 @@ func filterRoutes(routes []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) [
 // This avoids a full ifc.FlushRoutes call.
 // dontDelete is a list of interface address routes that the
 // synchronization logic should never delete.
-func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*winipcfg.RouteData, dontDelete []netaddr.IPPrefix) error {
+func syncRoutes(ifc *winipcfg.IPAdapterAddresses, want []*winipcfg.RouteData, dontDelete []netip.Prefix) error {
 	existingRoutes, err := getAllInterfaceRoutes(ifc)
 	if err != nil {
 		return err

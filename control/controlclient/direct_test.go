@@ -8,10 +8,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"testing"
 	"time"
 
-	"inet.af/netaddr"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsdial"
@@ -68,29 +68,25 @@ func TestNewDirect(t *testing.T) {
 	}
 
 	endpoints := fakeEndpoints(1, 2, 3)
-	changed = c.newEndpoints(12, endpoints)
+	changed = c.newEndpoints(endpoints)
 	if !changed {
-		t.Errorf("c.newEndpoints(12) want true got %v", changed)
+		t.Errorf("c.newEndpoints want true got %v", changed)
 	}
-	changed = c.newEndpoints(12, endpoints)
+	changed = c.newEndpoints(endpoints)
 	if changed {
-		t.Errorf("c.newEndpoints(12) want false got %v", changed)
-	}
-	changed = c.newEndpoints(13, endpoints)
-	if !changed {
-		t.Errorf("c.newEndpoints(13) want true got %v", changed)
+		t.Errorf("c.newEndpoints want false got %v", changed)
 	}
 	endpoints = fakeEndpoints(4, 5, 6)
-	changed = c.newEndpoints(13, endpoints)
+	changed = c.newEndpoints(endpoints)
 	if !changed {
-		t.Errorf("c.newEndpoints(13) want true got %v", changed)
+		t.Errorf("c.newEndpoints want true got %v", changed)
 	}
 }
 
 func fakeEndpoints(ports ...uint16) (ret []tailcfg.Endpoint) {
 	for _, port := range ports {
 		ret = append(ret, tailcfg.Endpoint{
-			Addr: netaddr.IPPortFrom(netaddr.IP{}, port),
+			Addr: netip.AddrPortFrom(netip.Addr{}, port),
 		})
 	}
 	return

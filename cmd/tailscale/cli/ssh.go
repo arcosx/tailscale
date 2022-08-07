@@ -10,15 +10,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"inet.af/netaddr"
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
@@ -63,7 +62,7 @@ func runSSH(ctx context.Context, args []string) error {
 		hostForSSH = v
 	}
 
-	ssh, err := exec.LookPath("ssh")
+	ssh, err := findSSH()
 	if err != nil {
 		// TODO(bradfitz): use Go's crypto/ssh client instead
 		// of failing. But for now:
@@ -164,10 +163,10 @@ func nodeDNSNameFromArg(st *ipnstate.Status, arg string) (dnsName string, ok boo
 	if arg == "" {
 		return
 	}
-	argIP, _ := netaddr.ParseIP(arg)
+	argIP, _ := netip.ParseAddr(arg)
 	for _, ps := range st.Peer {
 		dnsName = ps.DNSName
-		if !argIP.IsZero() {
+		if argIP.IsValid() {
 			for _, ip := range ps.TailscaleIPs {
 				if ip == argIP {
 					return dnsName, true
@@ -203,7 +202,7 @@ func isSSHOverTailscale() bool {
 	if !ok {
 		return false
 	}
-	ip, err := netaddr.ParseIP(ipStr)
+	ip, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		return false
 	}
